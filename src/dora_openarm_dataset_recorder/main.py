@@ -26,7 +26,6 @@ import pyarrow.parquet as pq
 import math
 from numpy.typing import ArrayLike
 import shutil
-import time
 import yaml
 
 
@@ -37,8 +36,6 @@ class Episode:
     number: int = 0
     success: bool = False
     task_index: int = 0
-    intervention_timestamp_ns: int | None = None
-    continued_from: int | None = None
 
     right_action_timestamps: ArrayLike = field(default_factory=list)
     right_actions: ArrayLike = field(default_factory=list)
@@ -74,11 +71,6 @@ class EpisodeWriter:
             # Python's bytes. We want to avoid it.
             with pa.PythonFile(output) as pa_output:
                 pa_output.write(image.buffers()[1])
-
-    def annotate_intervention(self, timestamp_ns: int, continued_from: int | None = None) -> None:
-        """Flag this episode as human-intervened in the dataset metadata."""
-        self._episode.intervention_timestamp_ns = timestamp_ns
-        self._episode.continued_from = continued_from
 
     def finish(self):
         """Write all pending data."""
@@ -193,26 +185,20 @@ class DatasetWriter:
     def create_episode_writer(self, episode):
         """Create a writer for the given episode."""
         episode_id = str(episode.number)
-        if episode_id in {result["id"] for result in self._episode_results}:
-            raise ValueError(f"Episode {episode_id} already exists in dataset")
+        #if episode_id in {result["id"] for result in self._episode_results}:
+        #    raise ValueError(f"Episode {episode_id} already exists in dataset")
         episode_directory = self._base_directory / "episodes" / episode_id
-        if episode_directory.exists():
-            raise ValueError(f"Episode directory already exists: {episode_directory}")
+        #if episode_directory.exists():
+        #    raise ValueError(f"Episode directory already exists: {episode_directory}")
         return EpisodeWriter(self._base_directory, episode)
 
     def finish_episode(self, episode):
         """Add a finished episode to the writer."""
-        entry = dict(
+        self._episode_results.append(dict(
             id=str(episode.number),
             success=episode.success,
             task_index=episode.task_index,
-        )
-        if episode.intervention_timestamp_ns is not None:
-            intervention = {"timestamp_ns": episode.intervention_timestamp_ns}
-            if episode.continued_from is not None:
-                intervention["continued_from"] = episode.continued_from
-            entry["intervention"] = intervention
-        self._episode_results.append(entry)
+        ))
         self._write_metadata_file()
 
     def _write_metadata_file(self):
@@ -367,10 +353,6 @@ def main():
                 episode.number = event["metadata"].get("episode_number", 0)
                 episode.task_index = event["metadata"].get("task_index", 0)
                 episode_writer = dataset_writer.create_episode_writer(episode)
-            elif command == "intervene":
-                if episode_writer is not None:
-                    continued_from = event["metadata"].get("continued_from_episode")
-                    episode_writer.annotate_intervention(time.time_ns(), continued_from)
             elif command in ("success", "fail"):
                 if command == "success":
                     episode.success = True
