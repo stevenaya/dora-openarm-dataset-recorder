@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "dora-openarm-dataset-recorder"
 version = "0.4.0"
@@ -35,9 +39,13 @@ dev = [
 
 [project.scripts]
 dora-openarm-dataset-recorder = "dora_openarm_dataset_recorder.main:main"
+dora-openarm-migrate-eval-metadata = "dora_openarm_dataset_recorder.migrate_eval_metadata:main"
 
 [project.urls]
 Repository = "https://github.com/enactic/dora-openarm-dataset-recorder"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.ruff.lint]
 extend-select = [
