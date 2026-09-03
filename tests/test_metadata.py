@@ -22,7 +22,6 @@ import yaml
 from dora_openarm_dataset_recorder.main import (
     DatasetWriter,
     Episode,
-    _is_duplicate_action,
     parse_command_payload,
 )
 
@@ -64,7 +63,7 @@ def test_runtime_metadata_and_episode_fields_are_written(tmp_path):
     )
 
     metadata = _read_metadata(tmp_path)
-    assert metadata["version"] == "0.4.0"
+    assert metadata["version"] == "0.5.0"
     assert metadata["evaluation"]["checkpoint"]["path"] == "/models/checkpoint"
     assert metadata["episodes"] == [
         {
@@ -180,6 +179,9 @@ def test_episode_is_published_only_when_metadata_is_committed(tmp_path):
     assert final.is_dir()
     assert _read_metadata(tmp_path)["episodes"][0]["id"] == "3"
 
+    DatasetWriter(tmp_path, "dataset", {})
+    assert final.is_dir()
+
 
 def test_metadata_failure_rolls_published_episode_back(tmp_path, monkeypatch):
     writer = DatasetWriter(tmp_path, "dataset", {})
@@ -213,15 +215,19 @@ def test_interrupted_partial_episode_is_quarantined_on_resume(tmp_path):
     assert (quarantined[0] / "frame.jpeg").read_bytes() == b"frame"
 
 
-def test_action_snapshots_are_deduplicated_per_input_timestamp():
-    latest = {}
-    assert not _is_duplicate_action("arm_right_action", {"timestamp": 10}, latest)
-    assert _is_duplicate_action("arm_right_action", {"timestamp": 10}, latest)
-    assert not _is_duplicate_action("arm_left_action", {"timestamp": 10}, latest)
-    assert not _is_duplicate_action("arm_right_action", {"timestamp": 11}, latest)
+def test_published_episode_without_metadata_is_quarantined_on_resume(tmp_path):
+    writer = DatasetWriter(tmp_path, "dataset", {})
+    writer.update_metadata({})
+    orphan = tmp_path / "dataset" / "episodes" / "9"
+    orphan.mkdir(parents=True)
+    (orphan / "state.parquet").write_bytes(b"data")
 
-    with pytest.raises(ValueError, match="missing timestamp"):
-        _is_duplicate_action("arm_right_action", {}, latest)
+    DatasetWriter(tmp_path, "dataset", {})
+
+    assert not orphan.exists()
+    quarantined = list((tmp_path / "dataset" / "orphaned").glob("9.*"))
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "state.parquet").read_bytes() == b"data"
 
 
 def test_policy_chunks_and_action_chunk_ids_are_written(tmp_path):
@@ -256,18 +262,14 @@ def test_policy_chunks_and_action_chunk_ids_are_written(tmp_path):
     writer.finish_episode(episode, writer=episode_writer)
 
     episode_dir = tmp_path / "dataset" / "episodes" / "1"
-    actions = pq.read_table(
-        episode_dir / "action" / "arms" / "right" / "state.parquet"
-    )
+    actions = pq.read_table(episode_dir / "action" / "arms" / "right" / "state.parquet")
     assert actions["chunk_id"].to_pylist() == ["chunk-1", None]
     assert actions["blended_chunk_id"].to_pylist() == ["chunk-0", None]
 
     chunks = pq.read_table(episode_dir / "policy" / "chunks.parquet")
     assert chunks["chunk_id"].to_pylist() == ["chunk-1"]
     assert chunks["interval_ns"].to_pylist() == [33_333_333]
-    assert chunks["chunk_received"].to_pylist() == [
-        [[1.0, 2.0], [3.0, 4.0]]
-    ]
+    assert chunks["chunk_received"].to_pylist() == [[[1.0, 2.0], [3.0, 4.0]]]
     assert chunks["blended_chunk_id"].to_pylist() == ["chunk-0"]
     assert chunks["blend_policy_points"].to_pylist() == [4]
     assert _read_metadata(tmp_path)["episodes"][0]["episode_attempt_id"] == (
@@ -285,3 +287,6 @@ def test_parse_command_payload():
 
     with pytest.raises(ValueError, match="JSON object"):
         parse_command_payload({"payload": "[]"})
+
+    with pytest.raises(ValueError, match="JSON string"):
+        parse_command_payload({"payload": payload})

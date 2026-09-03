@@ -204,7 +204,9 @@ class EpisodeWriter:
                 }
             )
         if chunk_ids is not None:
-            table = table.append_column("chunk_id", pa.array(chunk_ids, type=pa.string()))
+            table = table.append_column(
+                "chunk_id", pa.array(chunk_ids, type=pa.string())
+            )
             table = table.append_column(
                 "blended_chunk_id",
                 pa.array(blended_chunk_ids, type=pa.string()),
@@ -242,7 +244,7 @@ class EpisodeWriter:
 class DatasetWriter:
     """Write a dataset."""
 
-    _VERSION = "0.4.0"
+    _VERSION = "0.5.0"
     _RESERVED_ROOT_FIELDS = {"version", "episodes"}
 
     def __init__(self, directory, name, metadata):
@@ -278,7 +280,7 @@ class DatasetWriter:
         else:
             self._base_directory.mkdir(parents=True)
 
-        self._quarantine_partial_episodes()
+        self._quarantine_incomplete_episodes()
 
         for field_name in self._RESERVED_ROOT_FIELDS:
             self._metadata.pop(field_name, None)
@@ -299,7 +301,7 @@ class DatasetWriter:
         return EpisodeWriter(self._base_directory, episode)
 
     def finish_episode(self, episode, metadata=None, writer=None):
-        """Publish an episode and atomically add its result to metadata."""
+        """Publish an episode and add its result to metadata."""
         result = copy.deepcopy(episode.metadata)
         _deep_merge(result, metadata or {})
         result.update(
@@ -345,26 +347,37 @@ class DatasetWriter:
             self._metadata = previous_metadata
             raise
 
-    def _quarantine_partial_episodes(self):
-        """Move interrupted episode directories aside for manual inspection."""
+    def _quarantine_incomplete_episodes(self):
+        """Move interrupted or uncommitted episode directories aside."""
         episodes_directory = self._base_directory / "episodes"
         if not episodes_directory.exists():
             return
-        partial_directories = sorted(episodes_directory.glob(".partial-*"))
-        if not partial_directories:
+        recorded_ids = {str(result["id"]) for result in self._episode_results}
+        incomplete_directories = sorted(
+            path
+            for path in episodes_directory.iterdir()
+            if path.is_dir()
+            and (
+                path.name.startswith(".partial-")
+                or (path.name.isdigit() and path.name not in recorded_ids)
+            )
+        )
+        if not incomplete_directories:
             return
         orphaned_directory = self._base_directory / "orphaned"
         orphaned_directory.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        for partial_directory in partial_directories:
-            destination = orphaned_directory / f"{partial_directory.name}.{timestamp}"
+        for incomplete_directory in incomplete_directories:
+            destination = (
+                orphaned_directory / f"{incomplete_directory.name}.{timestamp}"
+            )
             suffix = 1
             while destination.exists():
                 destination = orphaned_directory / (
-                    f"{partial_directory.name}.{timestamp}.{suffix}"
+                    f"{incomplete_directory.name}.{timestamp}.{suffix}"
                 )
                 suffix += 1
-            shutil.move(str(partial_directory), destination)
+            shutil.move(str(incomplete_directory), destination)
             print(f"Quarantined interrupted episode: {destination}")
 
     def set_leader_ker_metadata(self, ker_metadata):
@@ -440,13 +453,11 @@ def parse_command_payload(metadata):
     payload = metadata.get("payload")
     if payload is None:
         return {}
-    if isinstance(payload, dict):
-        return copy.deepcopy(payload)
-    if isinstance(payload, bytes):
-        payload = payload.decode("utf-8")
+    if not isinstance(payload, str):
+        raise ValueError("command metadata payload must be a JSON string")
     try:
         parsed = json.loads(payload)
-    except (TypeError, json.JSONDecodeError) as error:
+    except json.JSONDecodeError as error:
         raise ValueError("command metadata payload must be valid JSON") from error
     if not isinstance(parsed, dict):
         raise ValueError("command metadata payload must be a JSON object")
@@ -467,17 +478,6 @@ def _send_command_result(node, command, ok, episode_id=None, error=None):
         "result",
         pa.array([json.dumps(result, ensure_ascii=True, separators=(",", ":"))]),
     )
-
-
-def _is_duplicate_action(event_id, metadata, last_action_timestamps):
-    """Deduplicate repeated latest-command snapshots by source timestamp."""
-    action_timestamp = metadata.get("timestamp")
-    if action_timestamp is None:
-        raise ValueError("missing timestamp")
-    if last_action_timestamps.get(event_id) == action_timestamp:
-        return True
-    last_action_timestamps[event_id] = action_timestamp
-    return False
 
 
 class FrequencyDetector:
@@ -635,6 +635,7 @@ def main():
                     candidate_writer = dataset_writer.create_episode_writer(candidate)
                     episode = candidate
                     episode_writer = candidate_writer
+                    last_action_timestamps.clear()
                     result_episode_id = episode.number
                 elif command in ("success", "fail"):
                     if episode is None:
@@ -694,7 +695,10 @@ def main():
             continue
 
         if event_id == "policy_chunk":
-            if episode is not None:
+            if (
+                episode is not None
+                and event["metadata"].get("episode_attempt_id") == episode.attempt_id
+            ):
                 event_metadata = event["metadata"]
                 episode.policy_chunks.append(
                     {
@@ -702,9 +706,7 @@ def main():
                         "episode_number": event_metadata.get(
                             "episode_number", episode.number
                         ),
-                        "episode_attempt_id": event_metadata.get(
-                            "episode_attempt_id", episode.attempt_id
-                        ),
+                        "episode_attempt_id": event_metadata.get("episode_attempt_id"),
                         "generated_timestamp_ns": event_metadata.get(
                             "generated_timestamp_ns", event_metadata.get("timestamp")
                         ),
@@ -714,22 +716,15 @@ def main():
                 )
             continue
 
-        if event_id in {"arm_right_action", "arm_left_action"}:
-            try:
-                duplicate = _is_duplicate_action(
-                    event_id,
-                    event["metadata"],
-                    last_action_timestamps,
-                )
-            except ValueError as error:
-                print(f"Ignoring {event_id!r} input: {error}")
-                continue
-            if duplicate:
-                continue
-
-        # Main process
         if episode is None:
             continue
+        timestamp = event["metadata"]["timestamp"]
+        if event_id in {"arm_right_action", "arm_left_action"}:
+            if last_action_timestamps.get(event_id) == timestamp:
+                continue
+            last_action_timestamps[event_id] = timestamp
+
+        # Main process
         if event_id in {"arm_right_action", "arm_left_action"}:
             chunk_id = event["metadata"].get("chunk_id")
             if chunk_id is not None:
@@ -741,7 +736,6 @@ def main():
                 ):
                     if key in event["metadata"]:
                         execution[key] = event["metadata"][key]
-        timestamp = event["metadata"]["timestamp"]
         if isinstance(timestamp, datetime.datetime):
             # Added by dora-rs automatically.
             # Convert to POSIX timestamp in nanosecond.

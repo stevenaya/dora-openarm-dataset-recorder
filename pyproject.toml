@@ -18,7 +18,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dora-openarm-dataset-recorder"
-version = "0.4.0"
+version = "0.5.0"
 authors = [{ name = "Enactic, Inc." }]
 description = "Dora node to record data as OpenArm dataset"
 license = { text = "Apache-2.0" }

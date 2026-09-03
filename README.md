@@ -25,10 +25,14 @@ writes `metadata.yaml` atomically. When the dataflow declares the optional `resu
 output, every command reports a JSON result containing `command`, `ok`, an optional
 `episode_id`, and an error message on failure.
 
-Active episodes are written under `episodes/.partial-<id>` and published under the final
-episode ID only when the data and metadata commit succeeds. Interrupted partial episodes
-are moved to `orphaned/` on the next startup. Repeated arm action snapshots are
-deduplicated per input using their `timestamp`; the stored data schema is unchanged.
+Active episodes are written under `episodes/.partial-<id>` and then published under the
+final episode ID. Interrupted partial episodes and published directories missing from
+`metadata.yaml` are moved to `orphaned/` on the next startup. Repeated arm action
+snapshots are deduplicated per input and episode using their `timestamp`.
+
+Dataset format 0.5.0 adds nullable `chunk_id` and `blended_chunk_id` columns to action
+Parquet files, plus `policy/chunks.parquet`. Episode files written by 0.4.0 remain valid;
+readers should treat absent chunk columns as null.
 
 ## Legacy evaluation metadata
 
