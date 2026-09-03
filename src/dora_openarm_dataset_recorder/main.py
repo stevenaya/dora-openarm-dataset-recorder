@@ -14,6 +14,8 @@
 
 """Node to record data from OpenArm and cameras as OpenArm dataset."""
 
+from __future__ import annotations
+
 import argparse
 from dataclasses import dataclass, field
 import datetime
@@ -36,22 +38,29 @@ class Episode:
     """Episode related data."""
 
     number: int = 0
+    attempt_id: str | None = None
     success: bool = False
     task_index: int = 0
     metadata: dict = field(default_factory=dict)
 
     right_action_timestamps: ArrayLike = field(default_factory=list)
     right_actions: ArrayLike = field(default_factory=list)
+    right_action_chunk_ids: ArrayLike = field(default_factory=list)
+    right_action_blended_chunk_ids: ArrayLike = field(default_factory=list)
     right_observation_timestamps: ArrayLike = field(default_factory=list)
     right_observations: ArrayLike = field(default_factory=list)
     left_action_timestamps: ArrayLike = field(default_factory=list)
     left_actions: ArrayLike = field(default_factory=list)
+    left_action_chunk_ids: ArrayLike = field(default_factory=list)
+    left_action_blended_chunk_ids: ArrayLike = field(default_factory=list)
     left_observation_timestamps: ArrayLike = field(default_factory=list)
     left_observations: ArrayLike = field(default_factory=list)
     elevation_action_timestamps: ArrayLike = field(default_factory=list)
     elevation_actions: ArrayLike = field(default_factory=list)
     elevation_observation_timestamps: ArrayLike = field(default_factory=list)
     elevation_observations: ArrayLike = field(default_factory=list)
+    policy_chunks: list[dict] = field(default_factory=list)
+    chunk_execution: dict[str, dict] = field(default_factory=dict)
 
 
 def extract_values(value: pa.Array, key: str) -> np.ndarray:
@@ -93,6 +102,8 @@ class EpisodeWriter:
                 self._base_directory / "action" / "arms" / "right",
                 self._episode.right_action_timestamps,
                 self._episode.right_actions,
+                chunk_ids=self._episode.right_action_chunk_ids,
+                blended_chunk_ids=self._episode.right_action_blended_chunk_ids,
             )
         if self._episode.right_observations:
             self._write_kinematic_state(
@@ -105,6 +116,8 @@ class EpisodeWriter:
                 self._base_directory / "action" / "arms" / "left",
                 self._episode.left_action_timestamps,
                 self._episode.left_actions,
+                chunk_ids=self._episode.left_action_chunk_ids,
+                blended_chunk_ids=self._episode.left_action_blended_chunk_ids,
             )
         if self._episode.left_observations:
             self._write_kinematic_state(
@@ -124,6 +137,8 @@ class EpisodeWriter:
                 self._episode.elevation_observation_timestamps,
                 self._episode.elevation_observations,
             )
+        if self._episode.policy_chunks:
+            self._write_policy_chunks()
         os.replace(self._base_directory, self._final_directory)
         self._published = True
 
@@ -148,7 +163,15 @@ class EpisodeWriter:
         )
         pq.write_table(table, output_path)
 
-    def _write_kinematic_state(self, base_path, timestamps, states):
+    def _write_kinematic_state(
+        self,
+        base_path,
+        timestamps,
+        states,
+        *,
+        chunk_ids=None,
+        blended_chunk_ids=None,
+    ):
         output_path = base_path / "state.parquet"
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -180,7 +203,40 @@ class EpisodeWriter:
                     "qpos": pa.array(states, type=list_type),
                 }
             )
+        if chunk_ids is not None:
+            table = table.append_column("chunk_id", pa.array(chunk_ids, type=pa.string()))
+            table = table.append_column(
+                "blended_chunk_id",
+                pa.array(blended_chunk_ids, type=pa.string()),
+            )
         pq.write_table(table, output_path)
+
+    def _write_policy_chunks(self):
+        """Write the policy chunks received during this episode."""
+        records = []
+        for chunk in self._episode.policy_chunks:
+            record = dict(chunk)
+            chunk_id = record["chunk_id"]
+            if chunk_id is not None:
+                record.update(self._episode.chunk_execution.get(chunk_id, {}))
+            records.append(record)
+
+        schema = pa.schema(
+            [
+                ("chunk_id", pa.string()),
+                ("episode_number", pa.int64()),
+                ("episode_attempt_id", pa.string()),
+                ("generated_timestamp_ns", pa.timestamp("ns")),
+                ("interval_ns", pa.int64()),
+                ("chunk_received", pa.list_(pa.list_(pa.float32()))),
+                ("executor_received_timestamp_ns", pa.timestamp("ns")),
+                ("blended_chunk_id", pa.string()),
+                ("blend_policy_points", pa.int32()),
+            ]
+        )
+        output_path = self._base_directory / "policy" / "chunks.parquet"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.Table.from_pylist(records, schema=schema), output_path)
 
 
 class DatasetWriter:
@@ -251,6 +307,8 @@ class DatasetWriter:
             success=episode.success,
             task_index=episode.task_index,
         )
+        if episode.attempt_id is not None:
+            result["episode_attempt_id"] = episode.attempt_id
         self._episode_results.append(result)
         try:
             if writer is not None:
@@ -564,6 +622,10 @@ def main():
                     candidate.number = payload.get(
                         "episode_number", event["metadata"].get("episode_number", 0)
                     )
+                    candidate.attempt_id = payload.get(
+                        "episode_attempt_id",
+                        event["metadata"].get("episode_attempt_id"),
+                    )
                     candidate.task_index = payload.get(
                         "task_index", event["metadata"].get("task_index", 0)
                     )
@@ -631,6 +693,27 @@ def main():
             dataset_writer.set_leader_ker_metadata(ker_metadata)
             continue
 
+        if event_id == "policy_chunk":
+            if episode is not None:
+                event_metadata = event["metadata"]
+                episode.policy_chunks.append(
+                    {
+                        "chunk_id": event_metadata.get("chunk_id"),
+                        "episode_number": event_metadata.get(
+                            "episode_number", episode.number
+                        ),
+                        "episode_attempt_id": event_metadata.get(
+                            "episode_attempt_id", episode.attempt_id
+                        ),
+                        "generated_timestamp_ns": event_metadata.get(
+                            "generated_timestamp_ns", event_metadata.get("timestamp")
+                        ),
+                        "interval_ns": event_metadata["interval"],
+                        "chunk_received": event["value"].to_pylist(),
+                    }
+                )
+            continue
+
         if event_id in {"arm_right_action", "arm_left_action"}:
             try:
                 duplicate = _is_duplicate_action(
@@ -647,6 +730,17 @@ def main():
         # Main process
         if episode is None:
             continue
+        if event_id in {"arm_right_action", "arm_left_action"}:
+            chunk_id = event["metadata"].get("chunk_id")
+            if chunk_id is not None:
+                execution = episode.chunk_execution.setdefault(chunk_id, {})
+                for key in (
+                    "executor_received_timestamp_ns",
+                    "blended_chunk_id",
+                    "blend_policy_points",
+                ):
+                    if key in event["metadata"]:
+                        execution[key] = event["metadata"][key]
         timestamp = event["metadata"]["timestamp"]
         if isinstance(timestamp, datetime.datetime):
             # Added by dora-rs automatically.
@@ -668,6 +762,13 @@ def main():
             # right_action_timestamps
             timestamps_key = f"{key_prefix}_timestamps"
             getattr(episode, timestamps_key).append(timestamp)
+            if event_id in {"arm_right_action", "arm_left_action"}:
+                getattr(episode, f"{key_prefix}_chunk_ids").append(
+                    event["metadata"].get("chunk_id")
+                )
+                getattr(episode, f"{key_prefix}_blended_chunk_ids").append(
+                    event["metadata"].get("blended_chunk_id")
+                )
         elif event_id.startswith("elevation_"):
             # elevation_observation -> elevation_observations, elevation_observation_timestamps
             # elevation_action -> elevation_actions, elevation_action_timestamps

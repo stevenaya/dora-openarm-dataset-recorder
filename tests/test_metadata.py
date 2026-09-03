@@ -14,6 +14,8 @@
 
 import json
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import yaml
 
@@ -220,6 +222,57 @@ def test_action_snapshots_are_deduplicated_per_input_timestamp():
 
     with pytest.raises(ValueError, match="missing timestamp"):
         _is_duplicate_action("arm_right_action", {}, latest)
+
+
+def test_policy_chunks_and_action_chunk_ids_are_written(tmp_path):
+    writer = DatasetWriter(tmp_path, "dataset", {})
+    episode = Episode(number=1, attempt_id="attempt-1")
+    episode.right_action_timestamps = [10, 20]
+    episode.right_actions = [
+        pa.array([{"qpos": [1.0, 2.0]}]),
+        pa.array([{"qpos": [3.0, 4.0]}]),
+    ]
+    episode.right_action_chunk_ids = ["chunk-1", None]
+    episode.right_action_blended_chunk_ids = ["chunk-0", None]
+    episode.policy_chunks = [
+        {
+            "chunk_id": "chunk-1",
+            "episode_number": 1,
+            "episode_attempt_id": "attempt-1",
+            "generated_timestamp_ns": 5,
+            "interval_ns": 33_333_333,
+            "chunk_received": [[1.0, 2.0], [3.0, 4.0]],
+        }
+    ]
+    episode.chunk_execution = {
+        "chunk-1": {
+            "executor_received_timestamp_ns": 7,
+            "blended_chunk_id": "chunk-0",
+            "blend_policy_points": 4,
+        }
+    }
+
+    episode_writer = writer.create_episode_writer(episode)
+    writer.finish_episode(episode, writer=episode_writer)
+
+    episode_dir = tmp_path / "dataset" / "episodes" / "1"
+    actions = pq.read_table(
+        episode_dir / "action" / "arms" / "right" / "state.parquet"
+    )
+    assert actions["chunk_id"].to_pylist() == ["chunk-1", None]
+    assert actions["blended_chunk_id"].to_pylist() == ["chunk-0", None]
+
+    chunks = pq.read_table(episode_dir / "policy" / "chunks.parquet")
+    assert chunks["chunk_id"].to_pylist() == ["chunk-1"]
+    assert chunks["interval_ns"].to_pylist() == [33_333_333]
+    assert chunks["chunk_received"].to_pylist() == [
+        [[1.0, 2.0], [3.0, 4.0]]
+    ]
+    assert chunks["blended_chunk_id"].to_pylist() == ["chunk-0"]
+    assert chunks["blend_policy_points"].to_pylist() == [4]
+    assert _read_metadata(tmp_path)["episodes"][0]["episode_attempt_id"] == (
+        "attempt-1"
+    )
 
 
 def test_parse_command_payload():
