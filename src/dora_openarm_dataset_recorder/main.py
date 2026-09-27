@@ -14,6 +14,8 @@
 
 """Node to record data from OpenArm and cameras as OpenArm dataset."""
 
+from __future__ import annotations
+
 import argparse
 from dataclasses import dataclass, field
 import datetime
@@ -36,21 +38,29 @@ class Episode:
     """Episode related data."""
 
     number: int = 0
+    attempt_id: str | None = None
     success: bool = False
     task_index: int = 0
+    metadata: dict = field(default_factory=dict)
 
     right_action_timestamps: ArrayLike = field(default_factory=list)
     right_actions: ArrayLike = field(default_factory=list)
+    right_action_chunk_ids: ArrayLike = field(default_factory=list)
+    right_action_blended_chunk_ids: ArrayLike = field(default_factory=list)
     right_observation_timestamps: ArrayLike = field(default_factory=list)
     right_observations: ArrayLike = field(default_factory=list)
     left_action_timestamps: ArrayLike = field(default_factory=list)
     left_actions: ArrayLike = field(default_factory=list)
+    left_action_chunk_ids: ArrayLike = field(default_factory=list)
+    left_action_blended_chunk_ids: ArrayLike = field(default_factory=list)
     left_observation_timestamps: ArrayLike = field(default_factory=list)
     left_observations: ArrayLike = field(default_factory=list)
     elevation_action_timestamps: ArrayLike = field(default_factory=list)
     elevation_actions: ArrayLike = field(default_factory=list)
     elevation_observation_timestamps: ArrayLike = field(default_factory=list)
     elevation_observations: ArrayLike = field(default_factory=list)
+    policy_chunks: list[dict] = field(default_factory=list)
+    chunk_execution: dict[str, dict] = field(default_factory=dict)
 
 
 def extract_values(value: pa.Array, key: str) -> np.ndarray:
@@ -67,7 +77,11 @@ class EpisodeWriter:
         """Initialize variables."""
         self._directory = directory
         self._episode = episode
-        self._base_directory = self._directory / "episodes" / str(self._episode.number)
+        episodes_directory = self._directory / "episodes"
+        self._base_directory = episodes_directory / f".partial-{self._episode.number}"
+        self._final_directory = episodes_directory / str(self._episode.number)
+        self._base_directory.mkdir(parents=True)
+        self._published = False
 
     def write_camera_image(self, name, image, timestamp, format):
         """Write an image from a camera."""
@@ -82,12 +96,14 @@ class EpisodeWriter:
                 pa_output.write(image.buffers()[1])
 
     def finish(self):
-        """Write all pending data."""
+        """Write all pending data and publish the completed episode directory."""
         if self._episode.right_actions:
             self._write_kinematic_state(
                 self._base_directory / "action" / "arms" / "right",
                 self._episode.right_action_timestamps,
                 self._episode.right_actions,
+                chunk_ids=self._episode.right_action_chunk_ids,
+                blended_chunk_ids=self._episode.right_action_blended_chunk_ids,
             )
         if self._episode.right_observations:
             self._write_kinematic_state(
@@ -100,6 +116,8 @@ class EpisodeWriter:
                 self._base_directory / "action" / "arms" / "left",
                 self._episode.left_action_timestamps,
                 self._episode.left_actions,
+                chunk_ids=self._episode.left_action_chunk_ids,
+                blended_chunk_ids=self._episode.left_action_blended_chunk_ids,
             )
         if self._episode.left_observations:
             self._write_kinematic_state(
@@ -119,10 +137,20 @@ class EpisodeWriter:
                 self._episode.elevation_observation_timestamps,
                 self._episode.elevation_observations,
             )
+        if self._episode.policy_chunks:
+            self._write_policy_chunks()
+        os.replace(self._base_directory, self._final_directory)
+        self._published = True
 
     def cancel(self):
         """Cancel this episode."""
         shutil.rmtree(self._base_directory, ignore_errors=True)
+
+    def rollback_publish(self):
+        """Restore a published directory when the metadata commit fails."""
+        if self._published and self._final_directory.exists():
+            os.replace(self._final_directory, self._base_directory)
+            self._published = False
 
     def _write_positions(self, output_path, timestamps, positions):
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,7 +163,15 @@ class EpisodeWriter:
         )
         pq.write_table(table, output_path)
 
-    def _write_kinematic_state(self, base_path, timestamps, states):
+    def _write_kinematic_state(
+        self,
+        base_path,
+        timestamps,
+        states,
+        *,
+        chunk_ids=None,
+        blended_chunk_ids=None,
+    ):
         output_path = base_path / "state.parquet"
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -167,39 +203,87 @@ class EpisodeWriter:
                     "qpos": pa.array(states, type=list_type),
                 }
             )
+        if chunk_ids is not None:
+            table = table.append_column(
+                "chunk_id", pa.array(chunk_ids, type=pa.string())
+            )
+            table = table.append_column(
+                "blended_chunk_id",
+                pa.array(blended_chunk_ids, type=pa.string()),
+            )
         pq.write_table(table, output_path)
+
+    def _write_policy_chunks(self):
+        """Write the policy chunks received during this episode."""
+        records = []
+        for chunk in self._episode.policy_chunks:
+            record = dict(chunk)
+            chunk_id = record["chunk_id"]
+            if chunk_id is not None:
+                record.update(self._episode.chunk_execution.get(chunk_id, {}))
+            records.append(record)
+
+        schema = pa.schema(
+            [
+                ("chunk_id", pa.string()),
+                ("episode_number", pa.int64()),
+                ("episode_attempt_id", pa.string()),
+                ("generated_timestamp_ns", pa.timestamp("ns")),
+                ("interval_ns", pa.int64()),
+                ("chunk_received", pa.list_(pa.list_(pa.float32()))),
+                ("executor_received_timestamp_ns", pa.timestamp("ns")),
+                ("blended_chunk_id", pa.string()),
+                ("blend_policy_points", pa.int32()),
+            ]
+        )
+        output_path = self._base_directory / "policy" / "chunks.parquet"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.Table.from_pylist(records, schema=schema), output_path)
 
 
 class DatasetWriter:
     """Write a dataset."""
 
-    _VERSION = "0.4.0"
+    _VERSION = "0.5.0"
+    _RESERVED_ROOT_FIELDS = {"version", "episodes"}
 
     def __init__(self, directory, name, metadata):
         """Initialize variables."""
         self._directory = directory
         self._name = name
-        self._metadata = metadata
+        self._metadata = copy.deepcopy(metadata or {})
         self._base_directory = self._directory / name
         self._episode_results = []
         if self._base_directory.exists():
             existing = self._read_existing_metadata()
             if existing is not None:
-                mismatched = {
-                    k: v
-                    for k, v in self._metadata.items()
-                    if k in existing and existing[k] != v
-                }
+                mismatched = _metadata_mismatches(
+                    self._metadata,
+                    existing,
+                    ignored=self._RESERVED_ROOT_FIELDS,
+                )
                 if mismatched:
                     raise ValueError(
                         f"Existing dataset metadata does not match: {self._base_directory / 'metadata.yaml'}\n"
                         + "\n".join(
-                            f"  {k}: existing={existing.get(k)!r}, current={v!r}"
-                            for k, v in mismatched.items()
+                            f"  {path}: existing={values[0]!r}, current={values[1]!r}"
+                            for path, values in mismatched.items()
                         )
                     )
+                preserved = {
+                    key: value
+                    for key, value in existing.items()
+                    if key not in self._RESERVED_ROOT_FIELDS
+                }
+                _deep_merge(preserved, self._metadata)
+                self._metadata = preserved
         else:
             self._base_directory.mkdir(parents=True)
+
+        self._quarantine_incomplete_episodes()
+
+        for field_name in self._RESERVED_ROOT_FIELDS:
+            self._metadata.pop(field_name, None)
 
     def create_episode_writer(self, episode):
         """Create a writer for the given episode."""
@@ -207,20 +291,94 @@ class DatasetWriter:
         if episode_id in {result["id"] for result in self._episode_results}:
             raise ValueError(f"Episode {episode_id} already exists in dataset")
         episode_directory = self._base_directory / "episodes" / episode_id
+        partial_directory = self._base_directory / "episodes" / f".partial-{episode_id}"
         if episode_directory.exists():
             raise ValueError(f"Episode directory already exists: {episode_directory}")
+        if partial_directory.exists():
+            raise ValueError(
+                f"Partial episode directory already exists: {partial_directory}"
+            )
         return EpisodeWriter(self._base_directory, episode)
 
-    def finish_episode(self, episode):
-        """Add a finished episode to the writer."""
-        self._episode_results.append(
-            dict(
-                id=str(episode.number),
-                success=episode.success,
-                task_index=episode.task_index,
+    def finish_episode(self, episode, metadata=None, writer=None):
+        """Publish an episode and add its result to metadata."""
+        result = copy.deepcopy(episode.metadata)
+        _deep_merge(result, metadata or {})
+        result.update(
+            id=str(episode.number),
+            success=episode.success,
+            task_index=episode.task_index,
+        )
+        if episode.attempt_id is not None:
+            result["episode_attempt_id"] = episode.attempt_id
+        self._episode_results.append(result)
+        try:
+            if writer is not None:
+                writer.finish()
+            self._write_metadata_file()
+        except Exception:
+            self._episode_results.pop()
+            if writer is not None:
+                writer.rollback_publish()
+            raise
+
+    def update_metadata(self, payload):
+        """Merge dataset metadata from a command payload."""
+        if "episodes" in payload:
+            raise ValueError(
+                "historical episode patches are no longer supported; "
+                "run dora-openarm-migrate-eval-metadata"
+            )
+        dataset_patch = payload.get("dataset", {})
+        if not isinstance(dataset_patch, dict):
+            raise ValueError("metadata payload 'dataset' must be an object")
+        dataset_patch = {
+            key: value
+            for key, value in dataset_patch.items()
+            if key not in self._RESERVED_ROOT_FIELDS
+        }
+        updated_metadata = copy.deepcopy(self._metadata)
+        _deep_merge(updated_metadata, dataset_patch)
+        previous_metadata = self._metadata
+        self._metadata = updated_metadata
+        try:
+            self._write_metadata_file()
+        except Exception:
+            self._metadata = previous_metadata
+            raise
+
+    def _quarantine_incomplete_episodes(self):
+        """Move interrupted or uncommitted episode directories aside."""
+        episodes_directory = self._base_directory / "episodes"
+        if not episodes_directory.exists():
+            return
+        recorded_ids = {str(result["id"]) for result in self._episode_results}
+        incomplete_directories = sorted(
+            path
+            for path in episodes_directory.iterdir()
+            if path.is_dir()
+            and (
+                path.name.startswith(".partial-")
+                or (path.name.isdigit() and path.name not in recorded_ids)
             )
         )
-        self._write_metadata_file()
+        if not incomplete_directories:
+            return
+        orphaned_directory = self._base_directory / "orphaned"
+        orphaned_directory.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        for incomplete_directory in incomplete_directories:
+            destination = (
+                orphaned_directory / f"{incomplete_directory.name}.{timestamp}"
+            )
+            suffix = 1
+            while destination.exists():
+                destination = orphaned_directory / (
+                    f"{incomplete_directory.name}.{timestamp}.{suffix}"
+                )
+                suffix += 1
+            shutil.move(str(incomplete_directory), destination)
+            print(f"Quarantined interrupted episode: {destination}")
 
     def set_leader_ker_metadata(self, ker_metadata):
         """Record KER leader device metadata under equipment.leader.ker."""
@@ -237,8 +395,16 @@ class DatasetWriter:
         metadata["version"] = self._VERSION
         metadata["episodes"] = self._episode_results
         output_path = self._base_directory / "metadata.yaml"
-        with open(output_path, "w", encoding="utf-8") as f:
-            yaml.dump(metadata, f, default_flow_style=False, allow_unicode=True)
+        temporary_path = output_path.with_suffix(".yaml.tmp")
+        with open(temporary_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(
+                metadata,
+                f,
+                default_flow_style=False,
+                allow_unicode=True,
+                sort_keys=False,
+            )
+        os.replace(temporary_path, output_path)
 
     def _read_existing_metadata(self):
         metadata_path = self._base_directory / "metadata.yaml"
@@ -248,6 +414,70 @@ class DatasetWriter:
             existing_metadata = yaml.safe_load(f) or {}
         self._episode_results = existing_metadata.get("episodes", [])
         return existing_metadata
+
+
+def _deep_merge(target, patch):
+    """Recursively merge a mapping into another mapping."""
+    if not isinstance(patch, dict):
+        raise ValueError("metadata patch must be an object")
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_merge(target[key], value)
+        else:
+            target[key] = copy.deepcopy(value)
+
+
+def _metadata_mismatches(expected, existing, *, ignored=frozenset(), prefix=""):
+    """Find conflicting leaves while allowing extra fields in existing metadata."""
+    mismatches = {}
+    for key, expected_value in expected.items():
+        if key in ignored or key not in existing:
+            continue
+        path = f"{prefix}.{key}" if prefix else key
+        existing_value = existing[key]
+        if isinstance(expected_value, dict) and isinstance(existing_value, dict):
+            mismatches.update(
+                _metadata_mismatches(
+                    expected_value,
+                    existing_value,
+                    prefix=path,
+                )
+            )
+        elif expected_value != existing_value:
+            mismatches[path] = (existing_value, expected_value)
+    return mismatches
+
+
+def parse_command_payload(metadata):
+    """Parse the optional JSON object carried in Dora event metadata."""
+    payload = metadata.get("payload")
+    if payload is None:
+        return {}
+    if not isinstance(payload, str):
+        raise ValueError("command metadata payload must be a JSON string")
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ValueError("command metadata payload must be valid JSON") from error
+    if not isinstance(parsed, dict):
+        raise ValueError("command metadata payload must be a JSON object")
+    return parsed
+
+
+def _send_command_result(node, command, ok, episode_id=None, error=None):
+    """Report whether a recorder command completed successfully."""
+    outputs = node.node_config().get("outputs", [])
+    if "result" not in outputs:
+        return
+    result = {"command": command, "ok": ok}
+    if episode_id is not None:
+        result["episode_id"] = str(episode_id)
+    if error:
+        result["error"] = str(error)
+    node.send_output(
+        "result",
+        pa.array([json.dumps(result, ensure_ascii=True, separators=(",", ":"))]),
+    )
 
 
 class FrequencyDetector:
@@ -266,8 +496,15 @@ class FrequencyDetector:
             if config["id"] != node_id:
                 continue
             inputs = config["inputs"]
+            request = {
+                "latest_command": "request_command",
+                "state": "request_state",
+                "position": "request_position",
+            }.get(name)
             next_input = (
-                inputs.get("tick")
+                inputs.get("publish_tick")
+                or inputs.get(request)
+                or inputs.get("tick")
                 or inputs.get("request_state")
                 or inputs.get("request_position")
             )
@@ -367,11 +604,12 @@ def main():
         metadata = {}
     else:
         with open(args.metadata_file, encoding="utf-8") as f:
-            metadata = yaml.safe_load(f)
+            metadata = yaml.safe_load(f) or {}
     _collect_dynamic_metadata(metadata, args, node)
     dataset_writer = DatasetWriter(args.directory, args.name, metadata)
     episode = None
     episode_writer = None
+    last_action_timestamps = {}
     arm_observation_timestamp_key = None
 
     for event in node:
@@ -381,35 +619,109 @@ def main():
         event_id = event["id"]
         if event_id == "command":
             command = event["value"][0].as_py()
-            if command == "start":
-                episode = Episode()
-                episode.number = event["metadata"].get("episode_number", 0)
-                episode.task_index = event["metadata"].get("task_index", 0)
-                episode_writer = dataset_writer.create_episode_writer(episode)
-            elif command in ("success", "fail"):
-                if command == "success":
-                    episode.success = True
-                episode_writer.finish()
-                dataset_writer.finish_episode(episode)
-                episode = None
-                episode_writer = None
-            elif command == "cancel":
-                episode_writer.cancel()
-                episode = None
-                episode_writer = None
-            elif command == "quit":
-                if episode is not None:
-                    episode_writer.finish()
-                    dataset_writer.finish_episode(episode)
+            result_episode_id = episode.number if episode is not None else None
+            should_quit = False
+            try:
+                payload = parse_command_payload(event["metadata"])
+                if command == "start":
+                    if episode is not None:
+                        raise ValueError("an episode is already active")
+                    candidate = Episode()
+                    candidate.number = payload.get(
+                        "episode_number", event["metadata"].get("episode_number", 0)
+                    )
+                    candidate.attempt_id = payload.get(
+                        "episode_attempt_id",
+                        event["metadata"].get("episode_attempt_id"),
+                    )
+                    candidate.task_index = payload.get(
+                        "task_index", event["metadata"].get("task_index", 0)
+                    )
+                    candidate.metadata = payload.get("episode", {})
+                    if not isinstance(candidate.metadata, dict):
+                        raise ValueError("episode metadata must be an object")
+                    candidate_writer = dataset_writer.create_episode_writer(candidate)
+                    episode = candidate
+                    episode_writer = candidate_writer
+                    last_action_timestamps.clear()
+                    result_episode_id = episode.number
+                elif command in ("success", "fail"):
+                    if episode is None:
+                        raise ValueError("no episode is active")
+                    episode_metadata = payload.get("episode", {})
+                    if not isinstance(episode_metadata, dict):
+                        raise ValueError("episode metadata must be an object")
+                    episode.success = command == "success"
+                    dataset_writer.finish_episode(
+                        episode,
+                        episode_metadata,
+                        writer=episode_writer,
+                    )
                     episode = None
                     episode_writer = None
-                break
+                elif command == "cancel":
+                    if episode is not None:
+                        episode_writer.cancel()
+                        episode = None
+                        episode_writer = None
+                elif command == "metadata":
+                    dataset_writer.update_metadata(payload)
+                elif command == "quit":
+                    if episode is not None:
+                        episode_metadata = payload.get("episode", {})
+                        if not isinstance(episode_metadata, dict):
+                            raise ValueError("episode metadata must be an object")
+                        dataset_writer.finish_episode(
+                            episode,
+                            episode_metadata,
+                            writer=episode_writer,
+                        )
+                        episode = None
+                        episode_writer = None
+                    should_quit = True
+                else:
+                    raise ValueError("unknown command")
+            except Exception as error:
+                print(f"Ignoring {command!r} command: {error}")
+                _send_command_result(
+                    node,
+                    command,
+                    False,
+                    result_episode_id,
+                    error,
+                )
+            else:
+                _send_command_result(node, command, True, result_episode_id)
+                if should_quit:
+                    break
             continue
 
         if event_id == "ker_metadata":
             # KER leader device metadata (JSON) from the KER node.
             ker_metadata = json.loads(event["value"][0].as_py())
             dataset_writer.set_leader_ker_metadata(ker_metadata)
+            continue
+
+        if event_id == "policy_chunk":
+            if (
+                episode is not None
+                and event["metadata"].get("episode_attempt_id") == episode.attempt_id
+            ):
+                event_metadata = event["metadata"]
+                episode.policy_chunks.append(
+                    {
+                        "chunk_id": event_metadata.get("chunk_id"),
+                        "episode_number": event_metadata.get(
+                            "episode_number", episode.number
+                        ),
+                        "episode_attempt_id": event_metadata.get("episode_attempt_id"),
+                        "generated_timestamp_ns": event_metadata.get(
+                            "generated_timestamp_ns", event_metadata.get("timestamp")
+                        ),
+                        "interval_ns": event_metadata["interval"],
+                        "chunk_received": event["value"].to_pylist(),
+                    }
+                )
             continue
 
         timestamp_key = "timestamp"
@@ -430,10 +742,26 @@ def main():
                     f"{event_id} is missing locked timestamp field {timestamp_key!r}"
                 )
 
-        # Main process
         if episode is None:
             continue
         timestamp = event["metadata"][timestamp_key]
+        if event_id in {"arm_right_action", "arm_left_action"}:
+            if last_action_timestamps.get(event_id) == timestamp:
+                continue
+            last_action_timestamps[event_id] = timestamp
+
+        # Main process
+        if event_id in {"arm_right_action", "arm_left_action"}:
+            chunk_id = event["metadata"].get("chunk_id")
+            if chunk_id is not None:
+                execution = episode.chunk_execution.setdefault(chunk_id, {})
+                for key in (
+                    "executor_received_timestamp_ns",
+                    "blended_chunk_id",
+                    "blend_policy_points",
+                ):
+                    if key in event["metadata"]:
+                        execution[key] = event["metadata"][key]
         if isinstance(timestamp, datetime.datetime):
             # Added by dora-rs automatically.
             # Convert to POSIX timestamp in nanosecond.
@@ -454,6 +782,13 @@ def main():
             # right_action_timestamps
             timestamps_key = f"{key_prefix}_timestamps"
             getattr(episode, timestamps_key).append(timestamp)
+            if event_id in {"arm_right_action", "arm_left_action"}:
+                getattr(episode, f"{key_prefix}_chunk_ids").append(
+                    event["metadata"].get("chunk_id")
+                )
+                getattr(episode, f"{key_prefix}_blended_chunk_ids").append(
+                    event["metadata"].get("blended_chunk_id")
+                )
         elif event_id.startswith("elevation_"):
             # elevation_observation -> elevation_observations, elevation_observation_timestamps
             # elevation_action -> elevation_actions, elevation_action_timestamps
