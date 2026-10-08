@@ -497,6 +497,7 @@ class FrequencyDetector:
                 continue
             inputs = config["inputs"]
             request = {
+                "commanded_position": "request_state",
                 "latest_command": "request_command",
                 "state": "request_state",
                 "position": "request_position",
@@ -725,7 +726,10 @@ def main():
             continue
 
         timestamp_key = "timestamp"
-        if event_id in ("arm_right_observation", "arm_left_observation"):
+        if event_id in {"arm_right_action", "arm_left_action"}:
+            if "dispatch_timestamp" in event["metadata"]:
+                timestamp_key = "dispatch_timestamp"
+        elif event_id in ("arm_right_observation", "arm_left_observation"):
             if arm_observation_timestamp_key is None:
                 arm_observation_timestamp_key = (
                     "observation_timestamp"
@@ -745,6 +749,9 @@ def main():
         if episode is None:
             continue
         timestamp = event["metadata"][timestamp_key]
+        if isinstance(timestamp, datetime.datetime):
+            # Added by dora-rs automatically.
+            timestamp = math.ceil(timestamp.timestamp() * 1_000_000_000)
         if event_id in {"arm_right_action", "arm_left_action"}:
             if last_action_timestamps.get(event_id) == timestamp:
                 continue
@@ -762,10 +769,6 @@ def main():
                 ):
                     if key in event["metadata"]:
                         execution[key] = event["metadata"][key]
-        if isinstance(timestamp, datetime.datetime):
-            # Added by dora-rs automatically.
-            # Convert to POSIX timestamp in nanosecond.
-            timestamp = math.ceil(timestamp.timestamp() * 1_000_000_000)
         if event_id.startswith("arm_"):
             value = event["value"]
             if isinstance(value, pa.StructArray) and "new_position" in value.type.names:

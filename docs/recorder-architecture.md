@@ -378,8 +378,9 @@ authority for completed episode results.
 
 Arm observations lock `observation_timestamp` (or legacy `timestamp`) on the
 first observation for both arms for the entire process, including before an
-episode starts. A later missing selected field raises an error. Actions, lifter,
-and camera events use `timestamp` independently.
+episode starts. A later missing selected field raises an error. Arm actions use
+`dispatch_timestamp` when present, falling back to `timestamp` for legacy and
+MuJoCo outputs. Lifter and camera events use `timestamp` independently.
 
 - A `datetime.datetime` supplied by Dora is converted to POSIX nanoseconds.
 - A numeric timestamp is passed directly to the Arrow `timestamp[ns]` column.
@@ -395,10 +396,11 @@ in their event metadata.
 
 ### 6.2 Action Deduplication
 
-Arm actions commonly come from the driver's `latest_command` output, which may
-publish repeated snapshots of the same command. The recorder stores the last
-accepted `timestamp` independently for `arm_right_action` and
-`arm_left_action`:
+Arm actions commonly come from `commanded_position` (physical arm) or
+`latest_command_<side>` (MuJoCo), which may repeat the same command. The recorder
+stores the last selected action time independently for `arm_right_action` and
+`arm_left_action`. Physical snapshots use the stable `dispatch_timestamp`, not
+the timestamp of each snapshot publication:
 
 ```text
 same input + same timestamp as previous accepted action -> drop
@@ -902,9 +904,9 @@ recorder responsible for control, synchronization, and data cleaning.
     command:
       source: evaluation-ui/recorder_command
       queue_size: 10
-    arm_right_action: arm-right/latest_command
+    arm_right_action: arm-right/commanded_position
     arm_right_observation: arm-right/state
-    arm_left_action: arm-left/latest_command
+    arm_left_action: arm-left/commanded_position
     arm_left_observation: arm-left/state
     policy_chunk: policy-server/actions
     camera_ceiling: camera-ceiling/image
@@ -923,9 +925,9 @@ recorder responsible for control, synchronization, and data cleaning.
     command:
       source: ui/command
       queue_size: 10
-    arm_right_action: arm-right/latest_command
+    arm_right_action: arm-right/commanded_position
     arm_right_observation: arm-right/state
-    arm_left_action: arm-left/latest_command
+    arm_left_action: arm-left/commanded_position
     arm_left_observation: arm-left/state
     camera_ceiling: camera-ceiling/image
   outputs:

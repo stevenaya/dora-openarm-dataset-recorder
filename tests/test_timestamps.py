@@ -167,6 +167,49 @@ def command(name, number=0):
     }
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_commanded_position_uses_dispatch_time_and_deduplicates(run_events, side):
+    events = [command("start")]
+    for index, dispatch in enumerate(
+        (OBSERVATION_NS, OBSERVATION_NS, OBSERVATION_NS + 1)
+    ):
+        events.append(
+            {
+                "type": "INPUT",
+                "id": f"arm_{side}_action",
+                "value": pa.array([{"qpos": [0.25, 0.5]}]),
+                "metadata": {
+                    "timestamp": MESSAGE_DATETIME
+                    + datetime.timedelta(milliseconds=index),
+                    "observation_timestamp": MESSAGE_NS + index,
+                    "dispatch_timestamp": dispatch,
+                    "chunk_id": "chunk-a",
+                    "blended_chunk_id": "chunk-before",
+                },
+            }
+        )
+    events.append(command("success"))
+    episode = run_events(events) / "0"
+    table = pq.read_table(episode / "action" / "arms" / side / "state.parquet")
+    assert table["timestamp"].cast(pa.int64()).to_pylist() == [
+        OBSERVATION_NS,
+        OBSERVATION_NS + 1,
+    ]
+    assert table["qpos"].to_pylist() == [[0.25, 0.5], [0.25, 0.5]]
+    assert table["chunk_id"].to_pylist() == ["chunk-a", "chunk-a"]
+    assert table["blended_chunk_id"].to_pylist() == ["chunk-before", "chunk-before"]
+
+
+def test_legacy_command_keeps_source_timestamp(record_event):
+    episode = record_event(
+        "arm_right_action",
+        pa.array([{"qpos": [0.25]}]),
+        {"timestamp": MESSAGE_NS, "executed_timestamp": OBSERVATION_NS},
+    )
+    table = pq.read_table(episode / "action/arms/right/state.parquet")
+    assert table["timestamp"].cast(pa.int64()).to_pylist() == [MESSAGE_NS]
+
+
 def observation(side, snapshot=True):
     metadata = {"timestamp": MESSAGE_NS}
     if snapshot:

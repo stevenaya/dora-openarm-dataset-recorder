@@ -201,8 +201,10 @@ def test_command_and_state_publication_frequencies():
     detector = FrequencyDetector(configs)
     assert detector.detect("arm/state") == 50
     assert detector.detect("arm/latest_command") == 50
-    configs[0]["inputs"] = {"request_state": "dora/timer/millis/10",
-                            "request_command": "dora/timer/millis/20"}
+    configs[0]["inputs"] = {
+        "request_state": "dora/timer/millis/10",
+        "request_command": "dora/timer/millis/20",
+    }
     assert detector.detect("arm/state") == 100
     assert detector.detect("arm/latest_command") == 50
 
@@ -210,6 +212,14 @@ def test_command_and_state_publication_frequencies():
 def test_arm_left_action():
     detector = FrequencyDetector(CONFIGS)
     assert detector.detect("leader/left_follower_position") == pytest.approx(250.0)
+
+
+@pytest.mark.parametrize("request_input", ["request_state", "request_position"])
+def test_commanded_position_frequency(request_input):
+    detector = FrequencyDetector(
+        [{"id": "arm", "inputs": {request_input: "dora/timer/millis/20"}}]
+    )
+    assert detector.detect("arm/commanded_position") == 50
 
 
 def test_arm_left_observation():

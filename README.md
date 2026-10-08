@@ -8,8 +8,10 @@ The first left/right arm observation selects `observation_timestamp` if present,
 otherwise `timestamp`, for both arms for the process lifetime, even before
 recording starts. The selected field must remain present; restart the recorder
 to select another field. Episode start/cancel/completion do not reset it.
-Actions, cameras and lifter inputs still use `timestamp`. Action deduplication
-is per input and episode; it is independent of this observation-field selection.
+Arm actions use `dispatch_timestamp` when present, otherwise the source
+`timestamp` used by legacy and MuJoCo outputs. This selected time is stored and
+used for per-input, per-episode deduplication. Cameras and lifter inputs keep
+using `timestamp`; observation-field selection is independent.
 
 ## Commands
 
@@ -37,7 +39,7 @@ output, every command reports a JSON result containing `command`, `ok`, an optio
 Active episodes are written under `episodes/.partial-<id>` and then published under the
 final episode ID. Interrupted partial episodes and published directories missing from
 `metadata.yaml` are moved to `orphaned/` on the next startup. Repeated arm action
-snapshots are deduplicated per input and episode using their `timestamp`.
+snapshots are deduplicated per input and episode using the selected action time.
 
 Dataset format 0.5.0 adds nullable `chunk_id` and `blended_chunk_id` columns to action
 Parquet files, plus `policy/chunks.parquet`. Episode files written by 0.4.0 remain valid;
